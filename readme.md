@@ -20,5 +20,5 @@ chmod +x looklog.sh
 ```
 
 ```
-curl -x socks5h://xxx:123456@127.0.0.1:8100 https://chatgpt.com/cdn-cgi/trace
+curl -x socks5h://xxx:123456@127.0.0.1:1080 https://chatgpt.com/cdn-cgi/trace
 ```
