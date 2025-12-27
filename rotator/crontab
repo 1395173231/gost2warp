@@ -1,0 +1,11 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 每小时轮换重置一个 warp（每个 warp 每 3 小时重置一次）
+5 * * * * /usr/local/bin/rotate-next.sh >> /var/log/warp-rotator.log 2>&1
+
+# 可选：每 2 分钟同步链路，只保留健康 warp，避免 selector 命中不健康节点
+*/2 * * * * /usr/local/bin/sync-chain.sh >> /var/log/warp-rotator.log 2>&1
+
+# logrotate：每 30 分钟检查一次日志文件是否需要轮转
+*/30 * * * * /usr/sbin/logrotate -s /var/lib/warp-rotator/logrotate.status /etc/logrotate.d/warp-rotator >> /var/log/warp-rotator.log 2>&1

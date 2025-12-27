@@ -1,0 +1,45 @@
+services:
+  - name: "socks-proxy"
+    addr: ":1080"
+    handler:
+      type: auto
+      retries: 2
+      auther: socks-auther
+      chain: warp-chain
+    listener:
+      type: tcp
+
+authers:
+  - name: socks-auther
+    reload: 10s
+    file:
+      path: /run/secrets/gost_socks_auth
+
+chains:
+  - name: warp-chain
+    selector:
+      strategy: rand
+      maxFails: 1
+      failTimeout: 30s
+    hops:
+      - name: warp-hop
+        nodes:
+          - name: warp1
+            addr: warp1:1080
+            connector:
+              type: socks5
+            dialer:
+              type: tcp
+          - name: warp2
+            addr: warp2:1080
+            connector:
+              type: socks5
+            dialer:
+              type: tcp
+          - name: warp3
+            addr: warp3:1080
+            connector:
+              type: socks5
+            dialer:
+              type: tcp
+
