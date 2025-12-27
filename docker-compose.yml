@@ -79,8 +79,8 @@ services:
       - GOST_CONTAINER=gost
       - WARP_CONTAINERS=warp1,warp2,warp3
       - MIN_UPSTREAMS=2          # 至少保留几个健康 warp 才允许下线一个
-      - DRAIN_GRACE=60           # 摘除后最少等多少秒再开始判断连接数
-      - DRAIN_MAX=600            # 最多等多少秒（超时就继续重启，避免永远卡住）
+      - DRAIN_GRACE=120           # 摘除后最少等多少秒再开始判断连接数
+      - DRAIN_MAX=1800            # 最多等多少秒（超时就继续重启，避免永远卡住）
       - RESTART_TIMEOUT=240      # 等 warp 重启后变 healthy 的超时
       - CHECK_INTERVAL=5
       - TEST_URL=https://dash.cloudflare.com/cdn-cgi/trace
