@@ -3,7 +3,6 @@ kind: Kustomization
 namespace: gost2warp
 resources:
   - namespace.yaml
-  - gost-socks-auth.secret.yaml
   - gost-config.configmap.yaml
   - warp.workloads.yaml
   - gost.workloads.yaml

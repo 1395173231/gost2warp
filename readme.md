@@ -27,14 +27,16 @@ curl -x socks5h://xxx:123456@127.0.0.1:1080 https://chatgpt.com/cdn-cgi/trace
 
 本仓库已新增 `k3s/` 清单，支持在 k3s 里部署 `warp1/warp2/warp3 + gost + rotator CronJob`。
 
-### 1) 修改 socks 认证 Secret
+### 1) 配置 socks 认证环境变量
 
-编辑 `k3s/gost-socks-auth.secret.yaml`，将默认值改成你的账号密码：
+编辑 `k3s/gost.workloads.yaml`，修改 `gost` 容器环境变量：
 
 ```yaml
-stringData:
-	gost_socks_auth: |
-		xxx 123456
+env:
+	- name: GOST_SOCKS_USER
+		value: xxx
+	- name: GOST_SOCKS_PASS
+		value: 123456
 ```
 
 ### 2) 部署到 k3s

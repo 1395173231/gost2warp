@@ -17,11 +17,22 @@ spec:
         - name: gost
           image: gogost/gost:latest
           imagePullPolicy: IfNotPresent
-          args:
-            - -C
-            - /etc/gost/gost.yaml
-            - -api
-            - :18080
+          env:
+            - name: GOST_SOCKS_USER
+              value: change_me_user
+            - name: GOST_SOCKS_PASS
+              value: change_me_password
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              if [ -z "${GOST_SOCKS_USER:-}" ] || [ -z "${GOST_SOCKS_PASS:-}" ]; then
+                echo "GOST_SOCKS_USER or GOST_SOCKS_PASS is empty" >&2
+                exit 1
+              fi
+              printf '%s %s\n' "$GOST_SOCKS_USER" "$GOST_SOCKS_PASS" > /tmp/gost_socks_auth
+              chmod 600 /tmp/gost_socks_auth
+              exec gost -C /etc/gost/gost.yaml -api :18080
           ports:
             - name: socks
               containerPort: 1080
@@ -32,17 +43,10 @@ spec:
               mountPath: /etc/gost/gost.yaml
               subPath: gost.yaml
               readOnly: true
-            - name: gost-auth
-              mountPath: /tmp/gost_socks_auth
-              subPath: gost_socks_auth
-              readOnly: true
       volumes:
         - name: gost-config
           configMap:
             name: gost-config
-        - name: gost-auth
-          secret:
-            secretName: gost-socks-auth
 ---
 apiVersion: v1
 kind: Service
