@@ -1,5 +1,5 @@
 x-warp-common: &warp-common
-  image: aomingjun/warp:slim-latest
+  image: caomingjun/warp:latest
   restart: always
   container_name: "" # 占位，下面各自覆盖
   devices:
