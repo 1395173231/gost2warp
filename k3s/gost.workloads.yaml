@@ -33,7 +33,8 @@ spec:
               subPath: gost.yaml
               readOnly: true
             - name: gost-auth
-              mountPath: /run/secrets
+              mountPath: /tmp/gost_socks_auth
+              subPath: gost_socks_auth
               readOnly: true
       volumes:
         - name: gost-config

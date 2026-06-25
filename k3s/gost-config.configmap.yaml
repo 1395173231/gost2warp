@@ -20,7 +20,7 @@ data:
       - name: socks-auther
         reload: 10s
         file:
-          path: /run/secrets/gost_socks_auth
+          path: /tmp/gost_socks_auth
 
     chains:
       - name: warp-chain
