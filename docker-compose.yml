@@ -51,21 +51,7 @@ services:
       - warp1
       - warp2
       - warp3
-    # 用 CLI 参数启 API（global service），即使 reload/更新配置也不会影响 API 本身 ([gost.run](https://gost.run/en/getting-started/configuration-overview/))
     command: ["-C", "/etc/gost/gost.yaml", "-api", ":18080"]
-
-  autoheal:
-    image: willfarrell/autoheal:latest
-    container_name: autoheal
-    restart: always
-    environment:
-      - AUTOHEAL_CONTAINER_LABEL=autoheal
-      - AUTOHEAL_INTERVAL=10               # 每 10 秒扫一次（默认 5）([GitHub](https://github.com/willfarrell/docker-autoheal))
-      - AUTOHEAL_START_PERIOD=60           # 启动后 60 秒再开始介入（避免启动抖动）([GitHub](https://github.com/willfarrell/docker-autoheal))
-
-      # 不启用 schedule，避免强行定时重启掐长连接
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
 
   warp-rotator:
     build: ./rotator
@@ -78,10 +64,10 @@ services:
       - GOST_HOP=warp-hop
       - GOST_CONTAINER=gost
       - WARP_CONTAINERS=warp1,warp2,warp3
-      - MIN_UPSTREAMS=2          # 至少保留几个健康 warp 才允许下线一个
-      - DRAIN_GRACE=120           # 摘除后最少等多少秒再开始判断连接数
-      - DRAIN_MAX=1800            # 最多等多少秒（超时就继续重启，避免永远卡住）
-      - RESTART_TIMEOUT=240      # 等 warp 重启后变 healthy 的超时
+      - MIN_UPSTREAMS=2
+      - DRAIN_GRACE=120
+      - DRAIN_MAX=1800
+      - RESTART_TIMEOUT=240
       - CHECK_INTERVAL=5
       - TEST_URL=https://dash.cloudflare.com/cdn-cgi/trace
       - GOST_SOCKS_AUTH_FILE=/run/secrets/gost_socks_auth
@@ -99,4 +85,3 @@ volumes:
 secrets:
   gost_socks_auth:
     file: ./secrets/gost_socks_auth
-
