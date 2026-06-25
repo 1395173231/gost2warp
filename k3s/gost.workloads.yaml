@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gost
+  namespace: gost2warp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gost
+  template:
+    metadata:
+      labels:
+        app: gost
+    spec:
+      containers:
+        - name: gost
+          image: gogost/gost:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - -C
+            - /etc/gost/gost.yaml
+            - -api
+            - :18080
+          ports:
+            - name: socks
+              containerPort: 1080
+            - name: api
+              containerPort: 18080
+          volumeMounts:
+            - name: gost-config
+              mountPath: /etc/gost/gost.yaml
+              subPath: gost.yaml
+              readOnly: true
+            - name: gost-auth
+              mountPath: /run/secrets
+              readOnly: true
+      volumes:
+        - name: gost-config
+          configMap:
+            name: gost-config
+        - name: gost-auth
+          secret:
+            secretName: gost-socks-auth
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gost
+  namespace: gost2warp
+spec:
+  selector:
+    app: gost
+  ports:
+    - name: socks
+      port: 1080
+      targetPort: 1080
+      nodePort: 31080
+    - name: api
+      port: 18080
+      targetPort: 18080
+  type: NodePort

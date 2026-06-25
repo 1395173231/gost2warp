@@ -1,0 +1,322 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rotator-scripts
+  namespace: gost2warp
+data:
+  sync-chain.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    log() { printf '[%s] %s\n' "$(date -Is)" "$*" >&2; }
+
+    NAMESPACE="${NAMESPACE:-gost2warp}"
+    GOST_API="${GOST_API:-http://gost:18080}"
+    GOST_CHAIN="${GOST_CHAIN:-warp-chain}"
+    GOST_HOP="${GOST_HOP:-warp-hop}"
+    WARP_DEPLOYMENTS_CSV="${WARP_DEPLOYMENTS:-warp1,warp2,warp3}"
+
+    IFS=',' read -r -a WARPS <<< "${WARP_DEPLOYMENTS_CSV}"
+
+    api_ok() {
+      curl -fsS "${GOST_API}/config" >/dev/null
+    }
+
+    pod_ready() {
+      local deploy="$1"
+      local ready
+      ready="$(kubectl -n "$NAMESPACE" get deploy "$deploy" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+      [[ "${ready:-0}" -ge 1 ]]
+    }
+
+    build_chain_json() {
+      local -a nodes=("$@")
+      local json_nodes=""
+      local node
+      for node in "${nodes[@]}"; do
+        if [[ -n "$json_nodes" ]]; then
+          json_nodes+=","
+        fi
+        json_nodes+="{\"name\":\"${node}\",\"addr\":\"${node}:1080\",\"connector\":{\"type\":\"socks5\"},\"dialer\":{\"type\":\"tcp\"}}"
+      done
+      printf '{"name":"%s","selector":{"strategy":"rand","maxFails":1,"failTimeout":"30s"},"hops":[{"name":"%s","nodes":[%s]}]}' \
+        "$GOST_CHAIN" "$GOST_HOP" "$json_nodes"
+    }
+
+    put_chain() {
+      local json="$1"
+      local http_code
+
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X PUT "${GOST_API}/config/chains/${GOST_CHAIN}" \
+        -H 'Content-Type: application/json' \
+        -d "$json")
+
+      if [[ "$http_code" == "200" ]]; then
+        return 0
+      fi
+
+      curl -fsS -X POST "${GOST_API}/config/chains" \
+        -H 'Content-Type: application/json' \
+        -d "$json" >/dev/null
+    }
+
+    if ! api_ok; then
+      log "WARN: gost API not reachable"
+      exit 0
+    fi
+
+    healthy=()
+    for w in "${WARPS[@]}"; do
+      if pod_ready "$w"; then
+        healthy+=("$w")
+      fi
+    done
+
+    if (( ${#healthy[@]} == 0 )); then
+      log "WARN: no ready warp deployments"
+      exit 0
+    fi
+
+    readarray -t healthy_sorted < <(printf '%s\n' "${healthy[@]}" | sort -u)
+    put_chain "$(build_chain_json "${healthy_sorted[@]}")"
+    log "sync-chain: applied, ready warps = ${healthy_sorted[*]}"
+
+  rotate-next.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    log() { printf '[%s] %s\n' "$(date -Is)" "$*"; }
+
+    NAMESPACE="${NAMESPACE:-gost2warp}"
+    GOST_API="${GOST_API:-http://gost:18080}"
+    GOST_CHAIN="${GOST_CHAIN:-warp-chain}"
+    GOST_HOP="${GOST_HOP:-warp-hop}"
+    WARP_DEPLOYMENTS_CSV="${WARP_DEPLOYMENTS:-warp1,warp2,warp3}"
+    MIN_UPSTREAMS="${MIN_UPSTREAMS:-2}"
+    RESTART_TIMEOUT="${RESTART_TIMEOUT:-240}"
+    CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
+
+    IFS=',' read -r -a WARPS <<< "${WARP_DEPLOYMENTS_CSV}"
+
+    api_ok() {
+      curl -fsS "${GOST_API}/config" >/dev/null
+    }
+
+    pod_ready() {
+      local deploy="$1"
+      local ready
+      ready="$(kubectl -n "$NAMESPACE" get deploy "$deploy" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+      [[ "${ready:-0}" -ge 1 ]]
+    }
+
+    wait_deploy_ready() {
+      local deploy="$1"
+      local t=0
+      while (( t < RESTART_TIMEOUT )); do
+        if pod_ready "$deploy"; then
+          return 0
+        fi
+        sleep "$CHECK_INTERVAL"
+        t=$((t + CHECK_INTERVAL))
+      done
+      return 1
+    }
+
+    build_chain_json() {
+      local -a nodes=("$@")
+      local json_nodes=""
+      local node
+      for node in "${nodes[@]}"; do
+        if [[ -n "$json_nodes" ]]; then
+          json_nodes+=","
+        fi
+        json_nodes+="{\"name\":\"${node}\",\"addr\":\"${node}:1080\",\"connector\":{\"type\":\"socks5\"},\"dialer\":{\"type\":\"tcp\"}}"
+      done
+      printf '{"name":"%s","selector":{"strategy":"rand","maxFails":1,"failTimeout":"30s"},"hops":[{"name":"%s","nodes":[%s]}]}' \
+        "$GOST_CHAIN" "$GOST_HOP" "$json_nodes"
+    }
+
+    put_chain() {
+      local json="$1"
+      local http_code
+
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X PUT "${GOST_API}/config/chains/${GOST_CHAIN}" \
+        -H 'Content-Type: application/json' \
+        -d "$json")
+
+      if [[ "$http_code" == "200" ]]; then
+        return 0
+      fi
+
+      curl -fsS -X POST "${GOST_API}/config/chains" \
+        -H 'Content-Type: application/json' \
+        -d "$json" >/dev/null
+    }
+
+    choose_next_warp() {
+      local cm="warp-rotator-state"
+      local last="-1"
+      if kubectl -n "$NAMESPACE" get configmap "$cm" >/dev/null 2>&1; then
+        last="$(kubectl -n "$NAMESPACE" get configmap "$cm" -o jsonpath='{.data.last_index}' 2>/dev/null || echo -1)"
+      fi
+      local next=$(( (last + 1) % ${#WARPS[@]} ))
+      echo "$next"
+    }
+
+    save_last_index() {
+      local idx="$1"
+      kubectl -n "$NAMESPACE" create configmap warp-rotator-state \
+        --from-literal=last_index="$idx" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    }
+
+    if ! api_ok; then
+      log "ERROR: gost API not reachable"
+      exit 1
+    fi
+
+    idx="$(choose_next_warp)"
+    target="${WARPS[$idx]}"
+    save_last_index "$idx"
+
+    ready_total=0
+    for w in "${WARPS[@]}"; do
+      if pod_ready "$w"; then
+        ready_total=$((ready_total + 1))
+      fi
+    done
+
+    if (( ready_total < MIN_UPSTREAMS )); then
+      log "SKIP: ready warps ($ready_total) < MIN_UPSTREAMS ($MIN_UPSTREAMS)"
+      exit 0
+    fi
+
+    remain=()
+    for w in "${WARPS[@]}"; do
+      if [[ "$w" != "$target" ]] && pod_ready "$w"; then
+        remain+=("$w")
+      fi
+    done
+
+    if (( ${#remain[@]} < MIN_UPSTREAMS )); then
+      log "SKIP: removing $target would leave ${#remain[@]} upstreams < MIN_UPSTREAMS=$MIN_UPSTREAMS"
+      exit 0
+    fi
+
+    log "drain: remove $target from chain"
+    put_chain "$(build_chain_json "${remain[@]}")"
+
+    log "restart: rollout restart deploy/$target"
+    kubectl -n "$NAMESPACE" rollout restart deployment "$target" >/dev/null
+
+    if ! wait_deploy_ready "$target"; then
+      log "ERROR: deployment $target not ready after restart"
+      exit 1
+    fi
+
+    all_ready=()
+    for w in "${WARPS[@]}"; do
+      if pod_ready "$w"; then
+        all_ready+=("$w")
+      fi
+    done
+
+    log "restore: add $target back"
+    put_chain "$(build_chain_json "${all_ready[@]}")"
+    log "rotate done: $target"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: warp-rotator
+  namespace: gost2warp
+spec:
+  schedule: "5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: warp-rotator
+          restartPolicy: Never
+          containers:
+            - name: rotate-next
+              image: alpine:3.20
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - apk add --no-cache bash curl kubectl >/dev/null && /bin/bash /scripts/rotate-next.sh
+              env:
+                - name: NAMESPACE
+                  value: gost2warp
+                - name: GOST_API
+                  value: http://gost:18080
+                - name: GOST_CHAIN
+                  value: warp-chain
+                - name: GOST_HOP
+                  value: warp-hop
+                - name: WARP_DEPLOYMENTS
+                  value: warp1,warp2,warp3
+                - name: MIN_UPSTREAMS
+                  value: "2"
+                - name: RESTART_TIMEOUT
+                  value: "240"
+                - name: CHECK_INTERVAL
+                  value: "5"
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+          volumes:
+            - name: scripts
+              configMap:
+                name: rotator-scripts
+                defaultMode: 0755
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: warp-sync-chain
+  namespace: gost2warp
+spec:
+  schedule: "*/2 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: warp-rotator
+          restartPolicy: Never
+          containers:
+            - name: sync-chain
+              image: alpine:3.20
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - apk add --no-cache bash curl kubectl >/dev/null && /bin/bash /scripts/sync-chain.sh
+              env:
+                - name: NAMESPACE
+                  value: gost2warp
+                - name: GOST_API
+                  value: http://gost:18080
+                - name: GOST_CHAIN
+                  value: warp-chain
+                - name: GOST_HOP
+                  value: warp-hop
+                - name: WARP_DEPLOYMENTS
+                  value: warp1,warp2,warp3
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+          volumes:
+            - name: scripts
+              configMap:
+                name: rotator-scripts
+                defaultMode: 0755
