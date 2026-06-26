@@ -18,9 +18,10 @@ RESTART_TIMEOUT="${RESTART_TIMEOUT:-240}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
 TEST_URL="${TEST_URL:-https://dash.cloudflare.com/cdn-cgi/trace}"
 
-STATE_DIR="/var/lib/warp-rotator"
+STATE_DIR="${STATE_DIR:-/var/lib/warp-rotator}"
 LOCK_FILE="${STATE_DIR}/lock"
 STATE_FILE="${STATE_DIR}/last_index"
+DRAINING_TARGET_FILE="${STATE_DIR}/draining_target"
 
 mkdir -p "$STATE_DIR"
 
@@ -60,8 +61,8 @@ conn_count_established() {
   local warp_ip
   warp_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$warp")"
   if [[ -z "$warp_ip" ]]; then
-    echo 0
-    return
+    log "WARN: cannot determine IP for $warp"
+    return 1
   fi
   local iphex porthex
   iphex="$(ip_to_hex_le "$warp_ip")"
@@ -71,7 +72,20 @@ conn_count_established() {
     "awk 'NR>1{
        split(\$3,a,\":\");
        if (toupper(a[1])==\"$iphex\" && toupper(a[2])==\"$porthex\" && \$4==\"01\") c++
-     } END{print c+0}' /proc/net/tcp" 2>/dev/null || echo 0
+     } END{print c+0}' /proc/net/tcp"
+}
+
+confirmed_connection_count() {
+  local target="$1"
+  local count
+  if ! count="$(conn_count_established "$target")"; then
+    return 1
+  fi
+  if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+    log "WARN: invalid connection count for $target: $count"
+    return 1
+  fi
+  echo "$count"
 }
 
 # 生成 chain JSON（只包含指定 warps）
@@ -132,6 +146,34 @@ choose_next_warp() {
   echo "$next"
 }
 
+warp_exists() {
+  local target="$1"
+  local w
+  for w in "${WARPS[@]}"; do
+    [[ "$w" == "$target" ]] && return 0
+  done
+  return 1
+}
+
+draining_target() {
+  if [[ -f "$DRAINING_TARGET_FILE" ]]; then
+    local target
+    target="$(cat "$DRAINING_TARGET_FILE" 2>/dev/null || true)"
+    if [[ -n "$target" ]] && warp_exists "$target"; then
+      echo "$target"
+    fi
+  fi
+}
+
+mark_draining() {
+  local target="$1"
+  echo "$target" > "$DRAINING_TARGET_FILE"
+}
+
+clear_draining() {
+  rm -f "$DRAINING_TARGET_FILE"
+}
+
 rotate_one() {
   local target="$1"
 
@@ -168,6 +210,7 @@ rotate_one() {
   fi
 
   log "drain: remove $target from chain, remain: ${remain[*]}"
+  mark_draining "$target"
   put_chain "$(build_chain_json "${remain[@]}")"
 
   # 2) 立即做一次代理测试（确保更新后仍可用）
@@ -178,22 +221,27 @@ rotate_one() {
   sleep "$DRAIN_GRACE"
 
   local waited=0
-  while (( waited < DRAIN_MAX )); do
-    local c
-    c="$(conn_count_established "$target")"
-    log "drain: $target established connections = $c"
-    if (( c == 0 )); then
+  local active_conns=0
+  while true; do
+    if ! active_conns="$(confirmed_connection_count "$target")"; then
+      log "SKIP: cannot confirm $target has no established connections; keep it out of chain and do not restart"
+      proxy_test && log "proxy test with remaining OK" || log "WARN: proxy test with remaining FAILED"
+      return 0
+    fi
+    log "drain: $target established connections = $active_conns"
+    if (( active_conns == 0 )); then
       break
+    fi
+    if (( waited >= DRAIN_MAX )); then
+      log "SKIP: drain timeout (${DRAIN_MAX}s), $target still has $active_conns established connections; keep it out of chain and do not restart"
+      proxy_test && log "proxy test with remaining OK" || log "WARN: proxy test with remaining FAILED"
+      return 0
     fi
     sleep "$CHECK_INTERVAL"
     waited=$((waited + CHECK_INTERVAL))
   done
 
-  if (( waited >= DRAIN_MAX )); then
-    log "drain: timeout (${DRAIN_MAX}s), proceed restart anyway"
-  else
-    log "drain: connections drained in ${waited}s"
-  fi
+  log "drain: connections drained in ${waited}s"
 
   # 4) 重启 target
   log "restart: docker restart $target"
@@ -225,17 +273,23 @@ rotate_one() {
 
   log "restore: add $target back, healthy set: ${all[*]}"
   put_chain "$(build_chain_json "${all[@]}")"
+  clear_draining
 
   proxy_test && log "proxy test after restore OK" || log "WARN: proxy test after restore FAILED"
 
   log "=== rotate done: $target ==="
 }
 
-idx="$(choose_next_warp)"
-target="${WARPS[$idx]}"
+pending_target="$(draining_target)"
+if [[ -n "$pending_target" ]]; then
+  target="$pending_target"
+  log "resume drain: pending target $target"
+else
+  idx="$(choose_next_warp)"
+  target="${WARPS[$idx]}"
 
-# 记录 index（即使失败也推进，避免一直卡在同一个）
-echo "$idx" > "$STATE_FILE"
+  # 记录 index（即使失败也推进，避免一直卡在同一个）
+  echo "$idx" > "$STATE_FILE"
+fi
 
 rotate_one "$target"
-

@@ -3,9 +3,10 @@ set -euo pipefail
 
 log() { printf '[%s] %s\n' "$(date -Is)" "$*" >&2; }
 
-STATE_DIR="/var/lib/warp-rotator"
+STATE_DIR="${STATE_DIR:-/var/lib/warp-rotator}"
 LOCK_FILE="${STATE_DIR}/lock"
 STATE_FILE="${STATE_DIR}/sync-chain.last_healthy"
+DRAINING_TARGET_FILE="${STATE_DIR}/draining_target"
 mkdir -p "$STATE_DIR"
 
 exec 9>"$LOCK_FILE"
@@ -20,6 +21,25 @@ GOST_HOP="${GOST_HOP:-warp-hop}"
 
 WARP_CONTAINERS_CSV="${WARP_CONTAINERS:-warp1,warp2,warp3}"
 IFS=',' read -r -a WARPS <<< "${WARP_CONTAINERS_CSV}"
+
+warp_exists() {
+  local target="$1"
+  local w
+  for w in "${WARPS[@]}"; do
+    [[ "$w" == "$target" ]] && return 0
+  done
+  return 1
+}
+
+draining_target() {
+  if [[ -f "$DRAINING_TARGET_FILE" ]]; then
+    local target
+    target="$(cat "$DRAINING_TARGET_FILE" 2>/dev/null || true)"
+    if [[ -n "$target" ]] && warp_exists "$target"; then
+      echo "$target"
+    fi
+  fi
+}
 
 api_ok() { curl -fsS "${GOST_API}/config" >/dev/null; }
 
@@ -130,7 +150,11 @@ if ! api_ok; then
 fi
 
 healthy=()
+draining="$(draining_target)"
 for w in "${WARPS[@]}"; do
+  if [[ -n "$draining" && "$w" == "$draining" ]]; then
+    continue
+  fi
   [[ "$(docker_health "$w")" == "healthy" ]] && healthy+=("$w")
 done
 
@@ -150,4 +174,8 @@ fi
 
 put_chain "$(build_chain_json "${healthy_sorted[@]}")"
 echo "$desired_list" > "$STATE_FILE" 2>/dev/null || true
-log "sync-chain: applied, healthy warps = ${healthy_sorted[*]}"
+if [[ -n "$draining" ]]; then
+  log "sync-chain: applied, healthy warps = ${healthy_sorted[*]} (excluded draining $draining)"
+else
+  log "sync-chain: applied, healthy warps = ${healthy_sorted[*]}"
+fi

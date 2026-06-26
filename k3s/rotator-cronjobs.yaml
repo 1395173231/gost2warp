@@ -18,6 +18,25 @@ data:
 
     IFS=',' read -r -a WARPS <<< "${WARP_DEPLOYMENTS_CSV}"
 
+    warp_exists() {
+      local target="$1"
+      local w
+      for w in "${WARPS[@]}"; do
+        [[ "$w" == "$target" ]] && return 0
+      done
+      return 1
+    }
+
+    draining_target() {
+      local target
+      if kubectl -n "$NAMESPACE" get configmap warp-rotator-state >/dev/null 2>&1; then
+        target="$(kubectl -n "$NAMESPACE" get configmap warp-rotator-state -o jsonpath='{.data.draining_target}' 2>/dev/null || true)"
+        if [[ -n "$target" ]] && warp_exists "$target"; then
+          echo "$target"
+        fi
+      fi
+    }
+
     api_ok() {
       curl -fsS "${GOST_API}/config" >/dev/null
     }
@@ -67,7 +86,11 @@ data:
     fi
 
     healthy=()
+    draining="$(draining_target)"
     for w in "${WARPS[@]}"; do
+      if [[ -n "$draining" && "$w" == "$draining" ]]; then
+        continue
+      fi
       if pod_ready "$w"; then
         healthy+=("$w")
       fi
@@ -80,7 +103,11 @@ data:
 
     readarray -t healthy_sorted < <(printf '%s\n' "${healthy[@]}" | sort -u)
     put_chain "$(build_chain_json "${healthy_sorted[@]}")"
-    log "sync-chain: applied, ready warps = ${healthy_sorted[*]}"
+    if [[ -n "$draining" ]]; then
+      log "sync-chain: applied, ready warps = ${healthy_sorted[*]} (excluded draining $draining)"
+    else
+      log "sync-chain: applied, ready warps = ${healthy_sorted[*]}"
+    fi
 
   rotate-next.sh: |
     #!/usr/bin/env bash
@@ -94,10 +121,21 @@ data:
     GOST_HOP="${GOST_HOP:-warp-hop}"
     WARP_DEPLOYMENTS_CSV="${WARP_DEPLOYMENTS:-warp1,warp2,warp3}"
     MIN_UPSTREAMS="${MIN_UPSTREAMS:-2}"
+    DRAIN_GRACE="${DRAIN_GRACE:-60}"
+    DRAIN_MAX="${DRAIN_MAX:-600}"
     RESTART_TIMEOUT="${RESTART_TIMEOUT:-240}"
     CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
 
     IFS=',' read -r -a WARPS <<< "${WARP_DEPLOYMENTS_CSV}"
+
+    warp_exists() {
+      local target="$1"
+      local w
+      for w in "${WARPS[@]}"; do
+        [[ "$w" == "$target" ]] && return 0
+      done
+      return 1
+    }
 
     api_ok() {
       curl -fsS "${GOST_API}/config" >/dev/null
@@ -121,6 +159,84 @@ data:
         t=$((t + CHECK_INTERVAL))
       done
       return 1
+    }
+
+    ip_to_hex_le() {
+      local ip="$1"
+      awk -F. '{printf "%02X%02X%02X%02X", $4,$3,$2,$1}' <<<"$ip"
+    }
+
+    gost_pod_name() {
+      kubectl -n "$NAMESPACE" get pod -l app=gost \
+        -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' 2>/dev/null \
+      | awk '{print $1}'
+    }
+
+    target_ips() {
+      local deploy="$1"
+      local ip
+
+      ip="$(kubectl -n "$NAMESPACE" get service "$deploy" -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)"
+      if [[ -n "$ip" && "$ip" != "None" ]]; then
+        printf '%s\n' "$ip"
+      fi
+
+      kubectl -n "$NAMESPACE" get pod -l "app=$deploy" \
+        -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}' 2>/dev/null \
+      | awk 'NF'
+    }
+
+    conn_count_established() {
+      local deploy="$1"
+      local gost_pod ips_json
+
+      gost_pod="$(gost_pod_name)"
+      if [[ -z "$gost_pod" ]]; then
+        log "WARN: cannot find running gost pod"
+        return 1
+      fi
+
+      ips_json="$(
+        target_ips "$deploy" \
+        | awk 'NF' \
+        | sort -u \
+        | while read -r ip; do ip_to_hex_le "$ip"; done \
+        | awk '{printf "%s\"%s\"", sep, $0; sep=","}' \
+        | awk '{printf "[%s]", $0}'
+      )"
+
+      if [[ -z "$ips_json" || "$ips_json" == "[]" ]]; then
+        log "WARN: cannot determine service or pod IPs for $deploy"
+        return 1
+      fi
+
+      kubectl -n "$NAMESPACE" exec "$gost_pod" -- sh -c \
+        "awk -v ips='$ips_json' 'BEGIN{
+           gsub(/[][]/, \"\", ips);
+           n=split(ips, raw, \",\");
+           for (i=1; i<=n; i++) {
+             gsub(/\\\"/, \"\", raw[i]);
+             if (raw[i] != \"\") wanted[toupper(raw[i])] = 1;
+           }
+         }
+         NR>1{
+           split(\$3,a,\":\");
+           if (wanted[toupper(a[1])] && toupper(a[2])==\"0438\" && \$4==\"01\") c++;
+         }
+         END{print c+0}' /proc/net/tcp"
+    }
+
+    confirmed_connection_count() {
+      local target="$1"
+      local count
+      if ! count="$(conn_count_established "$target")"; then
+        return 1
+      fi
+      if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+        log "WARN: invalid connection count for $target: $count"
+        return 1
+      fi
+      echo "$count"
     }
 
     build_chain_json() {
@@ -165,11 +281,48 @@ data:
       echo "$next"
     }
 
+    state_value() {
+      local key="$1"
+      if kubectl -n "$NAMESPACE" get configmap warp-rotator-state >/dev/null 2>&1; then
+        kubectl -n "$NAMESPACE" get configmap warp-rotator-state -o "jsonpath={.data.${key}}" 2>/dev/null || true
+      fi
+    }
+
+    ensure_state_configmap() {
+      kubectl -n "$NAMESPACE" create configmap warp-rotator-state \
+        --from-literal=last_index="$(state_value last_index | awk 'NF{print; found=1} END{if (!found) print "-1"}')" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    }
+
     save_last_index() {
       local idx="$1"
-      kubectl -n "$NAMESPACE" create configmap warp-rotator-state \
-        --from-literal=last_index="$idx" \
-        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+      ensure_state_configmap
+      kubectl -n "$NAMESPACE" patch configmap warp-rotator-state \
+        --type merge \
+        -p "{\"data\":{\"last_index\":\"$idx\"}}" >/dev/null
+    }
+
+    mark_draining() {
+      local target="$1"
+      ensure_state_configmap
+      kubectl -n "$NAMESPACE" patch configmap warp-rotator-state \
+        --type merge \
+        -p "{\"data\":{\"draining_target\":\"$target\"}}" >/dev/null
+    }
+
+    clear_draining() {
+      ensure_state_configmap
+      kubectl -n "$NAMESPACE" patch configmap warp-rotator-state \
+        --type json \
+        -p '[{"op":"remove","path":"/data/draining_target"}]' >/dev/null 2>&1 || true
+    }
+
+    draining_target() {
+      local target
+      target="$(state_value draining_target)"
+      if [[ -n "$target" ]] && warp_exists "$target"; then
+        echo "$target"
+      fi
     }
 
     if ! api_ok; then
@@ -177,9 +330,15 @@ data:
       exit 1
     fi
 
-    idx="$(choose_next_warp)"
-    target="${WARPS[$idx]}"
-    save_last_index "$idx"
+    pending_target="$(draining_target)"
+    if [[ -n "$pending_target" ]]; then
+      target="$pending_target"
+      log "resume drain: pending target $target"
+    else
+      idx="$(choose_next_warp)"
+      target="${WARPS[$idx]}"
+      save_last_index "$idx"
+    fi
 
     ready_total=0
     for w in "${WARPS[@]}"; do
@@ -206,7 +365,32 @@ data:
     fi
 
     log "drain: remove $target from chain"
+    mark_draining "$target"
     put_chain "$(build_chain_json "${remain[@]}")"
+
+    log "drain: grace sleep ${DRAIN_GRACE}s"
+    sleep "$DRAIN_GRACE"
+
+    waited=0
+    active_conns=0
+    while true; do
+      if ! active_conns="$(confirmed_connection_count "$target")"; then
+        log "SKIP: cannot confirm $target has no established connections; keep it out of chain and do not restart"
+        exit 0
+      fi
+      log "drain: $target established connections = $active_conns"
+      if (( active_conns == 0 )); then
+        break
+      fi
+      if (( waited >= DRAIN_MAX )); then
+        log "SKIP: drain timeout (${DRAIN_MAX}s), $target still has $active_conns established connections; keep it out of chain and do not restart"
+        exit 0
+      fi
+      sleep "$CHECK_INTERVAL"
+      waited=$((waited + CHECK_INTERVAL))
+    done
+
+    log "drain: connections drained in ${waited}s"
 
     log "restart: rollout restart deploy/$target"
     kubectl -n "$NAMESPACE" rollout restart deployment "$target" >/dev/null
@@ -225,6 +409,7 @@ data:
 
     log "restore: add $target back"
     put_chain "$(build_chain_json "${all_ready[@]}")"
+    clear_draining
     log "rotate done: $target"
 ---
 apiVersion: batch/v1
@@ -264,6 +449,10 @@ spec:
                   value: warp1,warp2,warp3
                 - name: MIN_UPSTREAMS
                   value: "2"
+                - name: DRAIN_GRACE
+                  value: "120"
+                - name: DRAIN_MAX
+                  value: "1800"
                 - name: RESTART_TIMEOUT
                   value: "240"
                 - name: CHECK_INTERVAL
